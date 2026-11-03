@@ -1,0 +1,21 @@
+name: Go
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: test -z "$(gofmt -l .)"
+      - run: go mod verify
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go test ./ledger -run='^$' -fuzz='^FuzzTransferState$' -fuzztime=10s -parallel=2
+      - run: go test ./ledger -run='^$' -fuzz='^FuzzStoredRecords$' -fuzztime=10s -parallel=2

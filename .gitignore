@@ -19,3 +19,8 @@
 
 # Go workspace file
 go.work
+
+# Local ledger runtime data and private keys
+ledger-cli
+*.db
+*.key
