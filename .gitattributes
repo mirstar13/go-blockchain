@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# gofmt requires LF even when Windows Git enables core.autocrlf.
+*.go text eol=lf
