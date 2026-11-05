@@ -73,7 +73,7 @@ func TestCancellationCascadeAndReplay(t *testing.T) {
 	if err = c.Close(); err != nil {
 		t.Fatal(err)
 	}
-	c, err = Open(path)
+	c, err = Open(context.Background(), path, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestCancellationCascadeAndReplay(t *testing.T) {
 	if _, err = c.Cancel(r); !errors.Is(err, ErrConfirmed) {
 		t.Fatal(err)
 	}
-	if err = c.Validate(); err != nil {
+	if err = c.Validate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -133,7 +133,7 @@ func TestCancelVersusMiningCommit(t *testing.T) {
 		} else if mineErr != nil || !errors.Is(cancelErr, ErrConfirmed) {
 			t.Fatal(cancelErr, mineErr)
 		}
-		if err = c.Validate(); err != nil {
+		if err = c.Validate(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}

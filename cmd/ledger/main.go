@@ -25,6 +25,7 @@ const usage = `Usage: ledger <command> [flags]
   transfer --db ledger.db --key alice.key --to <address> --amount <integer> [--passphrase-file protected-file]
   lookup   --db ledger.db --id <transaction-id>
   cancel   --db ledger.db --id <transaction-id> --key alice.key [--passphrase-file protected-file]
+  transfer admission options: --max-pending 1000 --max-pending-per-sender 100
   pending  --db ledger.db
   mine     --db ledger.db --reward-to <address>
   blocks   --db ledger.db
@@ -38,7 +39,7 @@ func main() {
 	defer stop()
 	if e := run(ctx, os.Args[1:], os.Stdout); e != nil {
 		fmt.Fprintln(os.Stderr, "error:", e)
-		os.Exit(1)
+		os.Exit(exitCode(e))
 	}
 }
 func run(ctx context.Context, args []string, out io.Writer) error {
@@ -67,6 +68,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	fs.SetOutput(io.Discard)
 	var db, keyPath, output, address, to, source, transactionID, passphraseFile string
 	var amount uint64
+	options := ledger.Options{}
 	switch cmd {
 	case "wallet create":
 		fs.StringVar(&output, "out", "", "new key file")
@@ -91,6 +93,8 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	case "balance":
 		fs.StringVar(&address, "address", "", "account address")
 	case "transfer":
+		fs.IntVar(&options.MaxPending, "max-pending", ledger.DefaultMaxPending, "maximum pending transfers")
+		fs.IntVar(&options.MaxPendingPerSender, "max-pending-per-sender", ledger.DefaultMaxPendingPerSender, "maximum pending transfers per sender")
 		fs.StringVar(&keyPath, "key", "", "signing key")
 		fs.StringVar(&to, "to", "", "recipient")
 		fs.Uint64Var(&amount, "amount", 0, "integer amount")
@@ -180,7 +184,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		if source == "" {
 			return errors.New("--from is required")
 		}
-		if err := ledger.Restore(source, db); err != nil {
+		if err := ledger.Restore(ctx, source, db); err != nil {
 			return err
 		}
 		_, err := fmt.Fprintln(out, "Restored", db)
@@ -196,7 +200,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		_, e := fmt.Fprintln(out, "Initialized", db)
 		return e
 	}
-	c, e := ledger.Open(db)
+	c, e := ledger.Open(ctx, db, options)
 	if e != nil {
 		return e
 	}
@@ -249,7 +253,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		return printJSON(struct{ Removed []string }{ids})
 
 	case "backup":
-		if err := c.Backup(output); err != nil {
+		if err := c.Backup(ctx, output); err != nil {
 			return err
 		}
 		_, err := fmt.Fprintln(out, "Backup saved to", output)
@@ -330,11 +334,21 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		_, e = fmt.Fprintf(out, "Mined block %d: %s (%d transactions)\n", b.Height, h, len(b.Transactions))
 		return e
 	case "validate":
-		if e := c.Validate(); e != nil {
+		if e := c.Validate(ctx); e != nil {
 			return e
 		}
 		_, e = fmt.Fprintln(out, "Ledger is valid")
 		return e
 	}
 	return nil
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, context.Canceled) {
+		return 130
+	}
+	return 1
 }

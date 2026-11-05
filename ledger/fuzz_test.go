@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"math"
@@ -103,13 +104,13 @@ func FuzzStoredRecords(f *testing.F) {
 		if err = db.Close(); err != nil {
 			t.Fatal(err)
 		}
-		c, err := Open(path)
+		c, err := Open(context.Background(), path, Options{})
 		if err != nil {
 			return
 		}
 		defer c.Close()
 		// Any accepted mutation must still describe exactly the empty genesis ledger.
-		if err = c.Validate(); err != nil {
+		if err = c.Validate(context.Background()); err != nil {
 			t.Fatal("accepted database fails repeat validation", err)
 		}
 		blocks, err := c.Blocks()

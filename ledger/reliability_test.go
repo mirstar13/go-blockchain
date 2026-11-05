@@ -17,7 +17,7 @@ func TestOpenDoesNotInitializeInvalidFile(t *testing.T) {
 		if err := os.WriteFile(path, data, 0600); err != nil {
 			t.Fatal(err)
 		}
-		if c, err := Open(path); err == nil {
+		if c, err := Open(context.Background(), path, Options{}); err == nil {
 			c.Close()
 			t.Fatal("invalid file accepted")
 		}
@@ -30,7 +30,7 @@ func TestOpenDoesNotInitializeInvalidFile(t *testing.T) {
 		}
 	}
 	path := filepath.Join(t.TempDir(), "missing.db")
-	if _, err := Open(path); !errors.Is(err, os.ErrNotExist) {
+	if _, err := Open(context.Background(), path, Options{}); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
@@ -74,7 +74,7 @@ func TestCrashRecoveryHelper(t *testing.T) {
 	if stage == "" {
 		return
 	}
-	c, err := Open(os.Getenv("LEDGER_CRASH_DB"))
+	c, err := Open(context.Background(), os.Getenv("LEDGER_CRASH_DB"), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestCrashRecovery(t *testing.T) {
 			if !errors.As(err, &exit) || exit.ExitCode() != 23 {
 				t.Fatalf("unexpected child result: %v %s", err, output)
 			}
-			restored, err := Open(path)
+			restored, err := Open(context.Background(), path, Options{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -155,7 +155,7 @@ func TestCrashRecovery(t *testing.T) {
 			} else if len(blocks) != 3 || len(pending) != 0 || alice != (Account{90, 1}) || bob != (Account{10, 0}) {
 				t.Fatal("committed state lost after crash")
 			}
-			if err := restored.Validate(); err != nil {
+			if err := restored.Validate(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 		})

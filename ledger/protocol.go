@@ -204,6 +204,12 @@ func apply(accounts map[Address]Account, t Transaction) error {
 	return nil
 }
 func applyBlock(accounts map[Address]Account, parent, b Block) error {
+	return applyBlockContext(context.Background(), accounts, parent, b)
+}
+func applyBlockContext(ctx context.Context, accounts map[Address]Account, parent, b Block) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if parent.Height == math.MaxUint64 {
 		return ErrOverflow
 	}
@@ -225,9 +231,15 @@ func applyBlock(accounts map[Address]Account, parent, b Block) error {
 	// the caller's state as well as the persisted ledger.
 	candidate := make(map[Address]Account, len(accounts))
 	for address, account := range accounts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		candidate[address] = account
 	}
 	for _, t := range b.Transactions {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if e := apply(candidate, t); e != nil {
 			return e
 		}
@@ -238,6 +250,9 @@ func applyBlock(accounts map[Address]Account, parent, b Block) error {
 	}
 	a.Balance += Reward
 	candidate[b.RewardTo] = a
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for address, account := range candidate {
 		accounts[address] = account
 	}

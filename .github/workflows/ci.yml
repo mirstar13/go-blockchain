@@ -31,6 +31,8 @@ jobs:
         run: go test ./ledger -run='^$' -fuzz='^FuzzTransferState$' -fuzztime=10s -parallel=2
       - if: runner.os == 'Linux'
         run: go test ./ledger -run='^$' -fuzz='^FuzzStoredRecords$' -fuzztime=10s -parallel=2
+      - if: runner.os == 'Linux'
+        run: go test ./ledger -run='^$' -fuzz='^FuzzStateModel$' -fuzztime=10s -fuzzminimizetime=100ms -parallel=2
       - name: Build standalone Windows executable
         if: runner.os == 'Windows'
         env:

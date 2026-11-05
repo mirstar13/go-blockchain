@@ -25,7 +25,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	backup := filepath.Join(t.TempDir(), "ledger.backup")
-	if err := c.Backup(backup); err != nil {
+	if err := c.Backup(context.Background(), backup); err != nil {
 		t.Fatal(err)
 	}
 	before, err := os.ReadFile(backup)
@@ -40,14 +40,14 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	// earlier tip and pending transaction, not the new live state.
 	mustMine(t, c, a)
 	restoredPath := filepath.Join(t.TempDir(), "restored.db")
-	if err = Restore(backup, restoredPath); err != nil {
+	if err = Restore(context.Background(), backup, restoredPath); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.ReadFile(backup)
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatal("restore modified source", err)
 	}
-	restored, err := Open(restoredPath)
+	restored, err := Open(context.Background(), restoredPath, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	if err != nil || summary != (BalanceSummary{90, 0, 90, 1}) {
 		t.Fatal(summary, err)
 	}
-	if err = restored.Validate(); err != nil {
+	if err = restored.Validate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -81,13 +81,13 @@ func TestSnapshotFailurePreservesFiles(t *testing.T) {
 	if err := os.WriteFile(target, sentinel, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Backup(target); !errors.Is(err, os.ErrExist) {
+	if err := c.Backup(context.Background(), target); !errors.Is(err, os.ErrExist) {
 		t.Fatal(err)
 	}
-	if err := Restore(path, target); !errors.Is(err, os.ErrExist) {
+	if err := Restore(context.Background(), path, target); !errors.Is(err, os.ErrExist) {
 		t.Fatal(err)
 	}
-	if err := c.Backup(path); !errors.Is(err, os.ErrExist) {
+	if err := c.Backup(context.Background(), path); !errors.Is(err, os.ErrExist) {
 		t.Fatal(err)
 	}
 	after, err := os.ReadFile(target)
@@ -102,7 +102,7 @@ func TestSnapshotFailurePreservesFiles(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
-		if err := c.Backup(link); !errors.Is(err, os.ErrExist) {
+		if err := c.Backup(context.Background(), link); !errors.Is(err, os.ErrExist) {
 			t.Fatal(err)
 		}
 	})
@@ -115,7 +115,7 @@ func TestSnapshotFailurePreservesFiles(t *testing.T) {
 			case "truncated":
 				err = os.WriteFile(source, []byte("not a database"), 0600)
 			default:
-				err = c.Backup(source)
+				err = c.Backup(context.Background(), source)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -144,7 +144,7 @@ func TestSnapshotFailurePreservesFiles(t *testing.T) {
 			}
 			destDir := t.TempDir()
 			destination := filepath.Join(destDir, "restored")
-			if e = Restore(source, destination); e == nil {
+			if e = Restore(context.Background(), source, destination); e == nil {
 				t.Fatal("invalid backup accepted")
 			}
 			entries, e := os.ReadDir(destDir)
@@ -163,7 +163,7 @@ func TestSnapshotPublicationFailure(t *testing.T) {
 		t.Run(fmt.Sprint(race), func(t *testing.T) {
 			dir := t.TempDir()
 			destination := filepath.Join(dir, "snapshot")
-			err := writeSnapshot(destination, func(out *os.File) error {
+			err := writeSnapshot(context.Background(), destination, func(out *os.File) error {
 				if !race {
 					_, e := out.Write([]byte("partial"))
 					if e != nil {
@@ -223,10 +223,10 @@ func TestBackupDuringSubmissions(t *testing.T) {
 	}()
 	for i := 0; i < 5; i++ {
 		path := filepath.Join(t.TempDir(), "snapshot")
-		if err := c.Backup(path); err != nil {
+		if err := c.Backup(context.Background(), path); err != nil {
 			t.Fatal(err)
 		}
-		snapshot, err := Open(path)
+		snapshot, err := Open(context.Background(), path, Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -301,10 +301,10 @@ func TestBackupDuringMining(t *testing.T) {
 	}()
 	for i := 0; i < 5; i++ {
 		path := filepath.Join(t.TempDir(), "snapshot")
-		if err := c.Backup(path); err != nil {
+		if err := c.Backup(context.Background(), path); err != nil {
 			t.Fatal(err)
 		}
-		snapshot, err := Open(path)
+		snapshot, err := Open(context.Background(), path, Options{})
 		if err != nil {
 			t.Fatal(err)
 		}

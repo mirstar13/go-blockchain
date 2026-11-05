@@ -6,6 +6,8 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -152,5 +154,40 @@ func TestEncryptedCancellationCLI(t *testing.T) {
 	}
 	if data, err := os.ReadFile(plain); err != nil || string(data) != hex.EncodeToString(seed)+"\n" {
 		t.Fatal("original key changed", err)
+	}
+}
+
+func TestTransferCapacityFlagsAndInterrupt(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "ledger.db")
+	key := filepath.Join(dir, "key")
+	password := filepath.Join(dir, "password")
+	if err := os.WriteFile(password, []byte("capacity test password"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	call := func(args ...string) string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := run(context.Background(), args, &out); err != nil {
+			t.Fatal(args, err)
+		}
+		return strings.TrimSpace(out.String())
+	}
+	call("init", "--db", db)
+	a := call("wallet", "create", "--out", key, "--passphrase-file", password)
+	call("mine", "--db", db, "--reward-to", a)
+	transfer := []string{"transfer", "--db", db, "--key", key, "--passphrase-file", password, "--to", a, "--amount", "1", "--max-pending", "1", "--max-pending-per-sender", "1"}
+	call(transfer...)
+	var out bytes.Buffer
+	if err := run(context.Background(), transfer, &out); !errors.Is(err, ledger.ErrQueueFull) {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := run(ctx, []string{"validate", "--db", db}, &out); !errors.Is(err, context.Canceled) || exitCode(err) != 130 {
+		t.Fatal(err)
+	}
+	if exitCode(fmt.Errorf("wrapped: %w", context.Canceled)) != 130 || exitCode(context.DeadlineExceeded) != 1 || exitCode(errors.New("failure")) != 1 || exitCode(nil) != 0 {
+		t.Fatal("exit status mapping")
 	}
 }

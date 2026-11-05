@@ -43,7 +43,7 @@ func newChain(t *testing.T) (*Chain, string) {
 	if e := Init(path); e != nil {
 		t.Fatal(e)
 	}
-	c, e := Open(path)
+	c, e := Open(context.Background(), path, Options{})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -80,7 +80,7 @@ func TestPersistentWorkflow(t *testing.T) {
 		t.Fatal(e)
 	}
 	var e error
-	c, e = Open(path)
+	c, e = Open(context.Background(), path, Options{})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -113,13 +113,13 @@ func TestPersistentWorkflow(t *testing.T) {
 	if len(p) != 0 {
 		t.Fatal("mined queue retained")
 	}
-	if e = c.Validate(); e != nil {
+	if e = c.Validate(context.Background()); e != nil {
 		t.Fatal(e)
 	}
 	if e = c.Close(); e != nil {
 		t.Fatal(e)
 	}
-	c, e = Open(path)
+	c, e = Open(context.Background(), path, Options{})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -249,6 +249,7 @@ func mustHash(t *testing.T, b Block) Hash {
 }
 func TestQueueOrderAndBlockLimit(t *testing.T) {
 	c, _ := newChain(t)
+	c.options.MaxPendingPerSender = 200
 	a, k := identity(t)
 	mustMine(t, c, a)
 	// Self-transfers preserve confirmed balance but reserve one unit each in queue.
@@ -273,11 +274,11 @@ func TestQueueOrderAndBlockLimit(t *testing.T) {
 	if len(p) != 1 || p[0].Nonce != 101 {
 		t.Fatal(p)
 	}
-	if e := c.Validate(); e != nil {
+	if e := c.Validate(context.Background()); e != nil {
 		t.Fatal(e)
 	}
 	mustMine(t, c, a)
-	if e := c.Validate(); e != nil {
+	if e := c.Validate(context.Background()); e != nil {
 		t.Fatal(e)
 	}
 }
@@ -342,7 +343,7 @@ func TestCorruptionAndVersionRejected(t *testing.T) {
 			if e = c.Close(); e != nil {
 				t.Fatal(e)
 			}
-			opened, e := Open(path)
+			opened, e := Open(context.Background(), path, Options{})
 			if e == nil {
 				opened.Close()
 				t.Fatal("corrupt database opened")
@@ -355,14 +356,14 @@ func TestInitAndLock(t *testing.T) {
 	if e := Init(path); e == nil {
 		t.Fatal("overwrote database")
 	}
-	if second, e := Open(path); e == nil {
+	if second, e := Open(context.Background(), path, Options{}); e == nil {
 		second.Close()
 		t.Fatal("lock not enforced")
 	}
-	if e := c.Validate(); e != nil {
+	if e := c.Validate(context.Background()); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := Open(filepath.Join(t.TempDir(), "missing")); e == nil {
+	if _, e := Open(context.Background(), filepath.Join(t.TempDir(), "missing"), Options{}); e == nil {
 		t.Fatal("created missing database")
 	}
 }
@@ -413,7 +414,7 @@ func TestRollbackAfterWritesAndStaleSnapshot(t *testing.T) {
 	if len(blocks) != 2 || len(pending) != 1 || account != (Account{50, 0}) {
 		t.Fatal("partial write escaped rollback")
 	}
-	if e = c.Validate(); e != nil {
+	if e = c.Validate(context.Background()); e != nil {
 		t.Fatal(e)
 	}
 	mustMine(t, c, a)
@@ -451,7 +452,7 @@ func TestConcurrentDuplicateSubmission(t *testing.T) {
 	if err != nil || len(pending) != 1 {
 		t.Fatal(pending, err)
 	}
-	if err := c.Validate(); err != nil {
+	if err := c.Validate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }

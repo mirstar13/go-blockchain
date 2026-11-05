@@ -16,7 +16,10 @@ import (
 
 var buckets = []string{"meta", "blocks", "accounts", "pending", "pending_ids"}
 
-type Chain struct{ db *bolt.DB }
+type Chain struct {
+	db      *bolt.DB
+	options Options
+}
 
 func key(n uint64) []byte { var b [8]byte; binary.BigEndian.PutUint64(b[:], n); return b[:] }
 func put(b *bolt.Bucket, k []byte, v any) error {
@@ -66,7 +69,14 @@ func Init(path string) (err error) {
 
 // Open locks an existing database and validates its complete contents.
 // The caller must Close the chain. The zero value of Chain is not usable.
-func Open(path string) (*Chain, error) {
+func Open(ctx context.Context, path string, options Options) (*Chain, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	options, err := options.normalized()
+	if err != nil {
+		return nil, err
+	}
 	// Strip O_CREATE and inspect the opened descriptor: a failed Open must never
 	// create a missing file or let bbolt initialize an existing empty file.
 	db, e := bolt.Open(path, 0600, &bolt.Options{Timeout: time.Second, OpenFile: func(name string, flags int, mode os.FileMode) (*os.File, error) {
@@ -87,8 +97,8 @@ func Open(path string) (*Chain, error) {
 	if e != nil {
 		return nil, e
 	}
-	c := &Chain{db: db}
-	if e = c.Validate(); e != nil {
+	c := &Chain{db: db, options: options}
+	if e = c.Validate(ctx); e != nil {
 		_ = db.Close()
 		return nil, e
 	}
@@ -113,8 +123,14 @@ func readBlocks(tx *bolt.Tx) ([]Block, error) {
 	return blocks, e
 }
 func readAccounts(tx *bolt.Tx) (map[Address]Account, error) {
+	return readAccountsContext(context.Background(), tx)
+}
+func readAccountsContext(ctx context.Context, tx *bolt.Tx) (map[Address]Account, error) {
 	out := map[Address]Account{}
 	e := tx.Bucket([]byte("accounts")).ForEach(func(k, v []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if len(k) != 32 {
 			return ErrCorrupt
 		}
@@ -130,8 +146,14 @@ func readAccounts(tx *bolt.Tx) (map[Address]Account, error) {
 	return out, e
 }
 func readPending(tx *bolt.Tx) ([]Transaction, error) {
+	return readPendingContext(context.Background(), tx)
+}
+func readPendingContext(ctx context.Context, tx *bolt.Tx) ([]Transaction, error) {
 	var out []Transaction
 	e := tx.Bucket([]byte("pending")).ForEach(func(k, v []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if len(k) != 8 || v == nil || binary.BigEndian.Uint64(k) == 0 {
 			return ErrCorrupt
 		}
@@ -147,7 +169,13 @@ func readPending(tx *bolt.Tx) ([]Transaction, error) {
 
 // reserve counts only confirmed funds, never pending incoming transfers.
 func reserve(state map[Address]Account, pending []Transaction) error {
+	return reserveContext(context.Background(), state, pending)
+}
+func reserveContext(ctx context.Context, state map[Address]Account, pending []Transaction) error {
 	for _, t := range pending {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if e := t.Verify(); e != nil {
 			return e
 		}
@@ -168,80 +196,141 @@ func reserve(state map[Address]Account, pending []Transaction) error {
 	return nil
 }
 
-// Validate replays history and verifies the persisted state and pending indexes.
-func (c *Chain) Validate() error {
-	e := c.db.View(func(tx *bolt.Tx) error {
-		for _, name := range buckets {
-			if tx.Bucket([]byte(name)) == nil {
-				return ErrCorrupt
+// Validate replays history with cooperative cancellation. The replay retains
+// account state, but only one block at a time. Admission limits do not apply.
+func (c *Chain) Validate(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.db.View(func(tx *bolt.Tx) error { return c.validateTx(ctx, tx, Version) })
+}
+
+func (c *Chain) validateTx(ctx context.Context, tx *bolt.Tx, version uint64) error {
+	bad := func(category string, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: %s: %w", ErrCorrupt, category, err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, name := range buckets {
+		if tx.Bucket([]byte(name)) == nil {
+			return bad(name, ErrInvalid)
+		}
+	}
+	if !bytes.Equal(tx.Bucket([]byte("meta")).Get([]byte("version")), key(version)) {
+		return bad("storage version", ErrVersion)
+	}
+	state := map[Address]Account{}
+	cursor := tx.Bucket([]byte("blocks")).Cursor()
+	var parent Block
+	var height uint64
+	found := false
+	for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		category := fmt.Sprintf("block %d", height)
+		if !bytes.Equal(k, key(height)) {
+			return bad(category, ErrInvalid)
+		}
+		var block Block
+		if err := json.Unmarshal(v, &block); err != nil {
+			return bad(category, err)
+		}
+		if height == 0 {
+			if !reflect.DeepEqual(block, Genesis()) {
+				return bad("genesis", ErrInvalid)
 			}
+		} else if err := applyBlockContext(ctx, state, parent, block); err != nil {
+			return bad(category, err)
 		}
-		if !bytes.Equal(tx.Bucket([]byte("meta")).Get([]byte("version")), key(Version)) {
-			return ErrVersion
+		found = true
+		parent = block
+		if height == math.MaxUint64 {
+			return bad(category, ErrOverflow)
 		}
-		blocks, e := readBlocks(tx)
-		if e != nil {
-			return e
+		height++
+	}
+	if !found {
+		return bad("genesis", ErrInvalid)
+	}
+	// Compare accounts incrementally rather than building a second account map.
+	count := 0
+	err := tx.Bucket([]byte("accounts")).ForEach(func(k, v []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if len(blocks) == 0 || !reflect.DeepEqual(blocks[0], Genesis()) {
-			return ErrCorrupt
+		if len(k) != 32 {
+			return bad("account key", ErrInvalid)
 		}
-		state := map[Address]Account{}
-		for i := 1; i < len(blocks); i++ {
-			if e := applyBlock(state, blocks[i-1], blocks[i]); e != nil {
-				return fmt.Errorf("block %d: %w", i, e)
-			}
+		var address Address
+		copy(address[:], k)
+		var account Account
+		if err := json.Unmarshal(v, &account); err != nil {
+			return bad("account record", err)
 		}
-		stored, e := readAccounts(tx)
-		if e != nil {
-			return e
+		expected, ok := state[address]
+		if !ok || expected != account {
+			return bad("account index", ErrInvalid)
 		}
-		if !reflect.DeepEqual(state, stored) {
-			return fmt.Errorf("%w: account index", ErrCorrupt)
-		}
-		pending, e := readPending(tx)
-		if e != nil {
-			return e
-		}
-		if e = reserve(state, pending); e != nil {
-			return e
-		}
-		ids := tx.Bucket([]byte("pending_ids"))
-		count := 0
-		e = tx.Bucket([]byte("pending")).ForEach(func(k, v []byte) error {
-			var t Transaction
-			if e := json.Unmarshal(v, &t); e != nil {
-				return e
-			}
-			id, e := t.ID()
-			if e != nil {
-				return e
-			}
-			if !bytes.Equal(ids.Get(id[:]), k) {
-				return ErrCorrupt
-			}
-			if binary.BigEndian.Uint64(k) > tx.Bucket([]byte("pending")).Sequence() {
-				return ErrCorrupt
-			}
-			count++
-			return nil
-		})
-		if e != nil {
-			return e
-		}
-		n := 0
-		if e = ids.ForEach(func(k, v []byte) error { n++; return nil }); e != nil {
-			return e
-		}
-		if n != count {
-			return ErrCorrupt
-		}
+		count++
 		return nil
 	})
-	if e != nil {
-		return fmt.Errorf("validate ledger: %w: %w", ErrCorrupt, e)
+	if err != nil {
+		return err
 	}
-	return nil
+	if count != len(state) {
+		return bad("account index", ErrInvalid)
+	}
+	ids := tx.Bucket([]byte("pending_ids"))
+	pending := tx.Bucket([]byte("pending"))
+	count = 0
+	err = pending.ForEach(func(k, v []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(k) != 8 || binary.BigEndian.Uint64(k) == 0 || binary.BigEndian.Uint64(k) > pending.Sequence() {
+			return bad("pending sequence", ErrInvalid)
+		}
+		var transfer Transaction
+		if err := json.Unmarshal(v, &transfer); err != nil {
+			return bad("pending record", err)
+		}
+		if err := reserveContext(ctx, state, []Transaction{transfer}); err != nil {
+			return bad("pending transaction", err)
+		}
+		id, err := transfer.ID()
+		if err != nil {
+			return bad("pending ID", err)
+		}
+		if !bytes.Equal(ids.Get(id[:]), k) {
+			return bad("pending ID index", ErrInvalid)
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	indexed := 0
+	err = ids.ForEach(func(k, v []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		indexed++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if indexed != count {
+		return bad("pending ID index", ErrInvalid)
+	}
+	return ctx.Err()
 }
 
 // Blocks returns independently owned blocks in ascending height order.
@@ -307,16 +396,28 @@ func (c *Chain) Submit(t Transaction) (Hash, error) {
 		if ids.Get(id[:]) != nil {
 			return ErrDuplicate
 		}
-		s, e := readAccounts(tx)
+		p, e := readPending(tx)
 		if e != nil {
 			return e
 		}
-		p, e := readPending(tx)
+		s, e := readAccounts(tx)
 		if e != nil {
 			return e
 		}
 		if e = reserve(s, append(p, t)); e != nil {
 			return e
+		}
+		if len(p) >= c.options.MaxPending {
+			return &QueueFullError{Scope: "global", Limit: c.options.MaxPending, Count: len(p)}
+		}
+		senderCount := 0
+		for _, queued := range p {
+			if queued.Sender == t.Sender {
+				senderCount++
+			}
+		}
+		if senderCount >= c.options.MaxPendingPerSender {
+			return &QueueFullError{Scope: "sender", Limit: c.options.MaxPendingPerSender, Count: senderCount}
 		}
 		b := tx.Bucket([]byte("pending"))
 		if b.Sequence() == math.MaxUint64 {
@@ -345,15 +446,15 @@ func (c *Chain) Mine(ctx context.Context, to Address) (Block, error) {
 			return e
 		}
 		parent = tip
-		p, e := readPending(tx)
+		p, e := readPendingContext(ctx, tx)
 		if e != nil {
 			return e
 		}
-		s, e := readAccounts(tx)
+		s, e := readAccountsContext(ctx, tx)
 		if e != nil {
 			return e
 		}
-		if e = reserve(s, p); e != nil {
+		if e = reserveContext(ctx, s, p); e != nil {
 			return e
 		}
 		if len(p) > MaxTransactions {

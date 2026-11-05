@@ -23,7 +23,7 @@ export PATH=/workspace/.go-toolchain/go/bin:$PATH
 export GOCACHE=/workspace/.go-cache GOMODCACHE=/workspace/.go-modcache
 ```
 
-## CLI walkthrough
+## CLI walkthrough (Linux/Unix; see Windows below)
 
 Run commands in a directory where you want to keep the database and keys.
 Addresses are 64 hex characters: the Ed25519 public key itself.
@@ -50,7 +50,7 @@ nonce after confirmed and pending outgoing transfers. `mine` creates one block,
 with at most 100 transactions in persisted arrival order, then exits. Ctrl+C
 cancels without committing a block or consuming queued transfers. An interrupt
 arriving after a commit has completed cannot undo that commit. Commands report
-errors to stderr with a nonzero exit status. Database paths default to `ledger.db`.
+errors to stderr with a nonzero exit status (130 for interruption, 1 for other errors). Database paths default to `ledger.db`.
 Block and pending JSON displays addresses, hashes, and signatures as hex strings.
 Every transaction includes its computed `ID`; every block includes its `Hash`. Empty
 transaction lists are `[]`. Balance output includes the address, `Confirmed`,
@@ -59,9 +59,10 @@ pending self-transfers; incoming pending transfers do not increase available fun
 These are CLI presentation fields; stored records and protocol encodings are unchanged.
 Scripts consuming the former numeric-array or `Balance` output need updating.
 
-Key files use plaintext seeds by default; optional encrypted files are described below.
+On Unix, key files use plaintext seeds by default; optional encrypted files are described below.
+Windows requires encrypted keys, with plaintext accepted only for explicit migration.
 Creation uses mode 0600 and
-refuses existing paths. Loading rejects group/world-readable files. Keep keys
+refuses existing paths. On Unix, loading rejects group/world-readable files. Windows ACL protection is the user’s responsibility. Keep keys
 outside the database and back them up separately; possession authorizes spending.
 Initialization refuses an existing database. Other commands require an existing
 valid ledger and do not silently create one.
@@ -137,7 +138,8 @@ The old root-level `package main` demo and its API have been replaced. No legacy
 stored format existed. Storage is version 1; automatic migrations are not provided.
 Tests cover encoding, invalid transfers/blocks, queue reservations and ordering,
 reopening/corruption, rollback, cancellation, wallet files, and the CLI workflow.
-CI runs formatting, dependency verification, build, vet, tests, and the race detector.
+CI runs formatting, dependency verification, build, vet, and tests on Linux and
+Windows Server 2022. Linux also runs race detection and bounded fuzz campaigns.
 
 Networking, fork handling, distributed consensus, fees, pruning,
 and optimized indexes/startup are deferred. Hash links and proof of work alone do
@@ -153,12 +155,14 @@ first case and the complete new block, balances, and queue in the second case.
 These test abrupt process exit, not power loss, disk failure, or every possible
 interruption inside bbolt's page writes.
 
-Two fuzz targets exercise signed transfer arithmetic/replay invariants and malformed
+Fuzz targets exercise signed transfer arithmetic/replay invariants, independent
+state-model operation sequences, and malformed
 JSON application records inside structurally valid bbolt databases:
 
 ```sh
 go test ./ledger -run='^$' -fuzz='^FuzzTransferState$' -fuzztime=30s -parallel=2
 go test ./ledger -run='^$' -fuzz='^FuzzStoredRecords$' -fuzztime=30s -parallel=2
+go test ./ledger -run='^$' -fuzz='^FuzzStateModel$' -fuzztime=30s -fuzzminimizetime=100ms -parallel=2
 ```
 
 CI runs each for 10 seconds; seed cases also run with `go test ./...`. Record fuzzing
@@ -182,9 +186,11 @@ locking: a separate running CLI process must finish before another can open it.
 Restore copies the backup, validates its full history and indexes, then publishes
 a new database. The original backup is never opened for writing. Both commands
 require a new destination, refuse existing files and symlinks, and create files
-with mode 0600. They write to a temporary sibling, sync and validate it, then
-publish using an atomic hard link and sync the parent directory. The destination
-filesystem must support hard links and directory syncing. An error after publication
+with mode 0600 on Unix (Windows access is controlled by ACLs). They write to a temporary sibling, sync and validate it, then
+publish using an atomic hard link. Unix also syncs the parent directory. Windows
+omits directory syncing because Go cannot provide it there; power-loss durability
+of directory publication is not guaranteed. The destination filesystem must support
+hard links, and Unix requires directory syncing. Windows supports local NTFS. An error after publication
 explicitly reports that the file exists but directory syncing failed.
 
 Failed copying or validation removes temporary output and leaves no destination.
@@ -223,7 +229,8 @@ Restored copies of the same database share identity and may share old queue sequ
 
 ## Encrypted key files
 
-Use an owner-only passphrase file (mode 0600) containing a nonempty passphrase.
+Use a protected passphrase file (mode 0600 on Unix, restricted ACL on Windows)
+containing a nonempty passphrase.
 The passphrase is read from the file, never from a command-line value. A single
 trailing newline (LF or CRLF) is removed; other spaces are significant. File input
 is bounded and passphrases are limited to 4096 bytes.
@@ -242,7 +249,7 @@ The versioned envelope uses scrypt (N=32768, r=8, p=1), a fresh 16-byte salt,
 AES-256-GCM, and a fresh 12-byte nonce. The version is authenticated. Fixed KDF
 parameters and envelope lengths prevent hostile files requesting arbitrary work.
 Wrong passwords and authentication failures return an error without exposing keys.
-Creation refuses existing files. Legacy plaintext keys remain supported when the
+Creation refuses existing files. On Unix, legacy plaintext keys remain supported when the
 passphrase flag is omitted; there is no silent plaintext fallback when it is supplied.
 `wallet encrypt` leaves the original plaintext key in place; protect or retire that
 copy deliberately after verifying the encrypted copy. Protect passphrase files and
@@ -366,3 +373,66 @@ result in the draft release notes:
 6. Record any skipped checks or failures; do not publish until required checks pass.
 
 Hosted CI success and Linux cross-compilation alone are not Windows 10 verification.
+
+## Resilience: admission limits and cancellation
+
+Pending admission defaults to 1,000 transfers overall and 100 per sender. Limits
+are local policy, not consensus rules, and are not stored in the database. Configure
+both for a transfer command when needed:
+
+```sh
+./ledger-cli transfer --db ledger.db --key alice.key --to <address> --amount 1 --max-pending 200 --max-pending-per-sender 20
+```
+
+Windows additionally requires `--passphrase-file`. Zero selects that field's
+default; negative values and per-sender limits exceeding the global limit are
+rejected. A global override below 100 therefore needs an explicit compatible
+per-sender override. Limits cannot be disabled. The existing signature, duplicate,
+nonce, and funds checks precede capacity checks. Capacity is checked atomically
+before allocating an arrival sequence or writing queue entries; nothing is evicted.
+
+A valid older queue above the selected caps can still be opened, validated, backed
+up, restored, mined, or cancelled. New submissions must satisfy both caps. Mining
+and cancellation release capacity; choosing smaller limits never deletes entries.
+
+The library API now requires explicit contexts for opening and maintenance:
+
+```go
+chain, err := ledger.Open(ctx, path, ledger.Options{
+    MaxPending: 1000,
+    MaxPendingPerSender: 100,
+})
+// Check err, then defer chain.Close().
+err = chain.Validate(ctx)
+err = chain.Backup(ctx, backupPath)
+err = ledger.Restore(ctx, backupPath, restoredPath)
+```
+
+`Options{}` selects defaults. Use `context.Background()` for callers that do not
+need cancellation. `Mine(ctx, address)` is unchanged. `ErrQueueFull` supports
+`errors.Is`; `*QueueFullError` exposes `Scope` (global/sender), `Limit`, and the
+current `Count`. Options are associated with an open handle; reopening accepts a
+new policy. Protocol identity, hashing, stored-data format, and key envelopes remain unchanged.
+
+Ctrl+C propagates through database opening, validation, mining, backup, and restore.
+Validation streams block records and compares account and queue indexes, checking
+cancellation between records and state transitions. It still retains account state;
+this is not a hard memory bound for arbitrarily large databases. Cancelled opening
+closes the database and releases its lock. Context cancellation and deadlines remain
+identifiable through `errors.Is` and are not reported as corrupt ledger data.
+
+Snapshot copies check cancellation in chunks of at most 32 KiB and throughout
+validation. Before publication, cancellation closes handles, removes temporary
+output, and leaves the destination absent. Immediately before linking the snapshot,
+the context is checked one final time. After publication succeeds, directory-sync
+bookkeeping completes regardless of cancellation; a late interrupt cannot undo a
+published snapshot. Directory-sync failures still report that the snapshot exists.
+Cancellation is cooperative: an active filesystem call or bbolt lock wait cannot
+be forcibly interrupted. Database opening retains its one-second lock timeout.
+
+The independent model tests use their own account and reservation arithmetic to
+compare queue order, balances, nonces, and transaction status after submissions,
+rejections, cascading cancellations, mining, and reopening with changed limits.
+Fuzz inputs are bounded to four accounts, 32 actions, and four mined blocks. Neither
+production state-transition helpers nor reservation helpers serve as the model's
+oracle. Existing crash, concurrency, Windows, and backup tests remain enabled.
