@@ -14,6 +14,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// Base buckets are shared by storage versions 1 and 2; v2 also requires confirmed_ids.
 var buckets = []string{"meta", "blocks", "accounts", "pending", "pending_ids"}
 
 type Chain struct {
@@ -55,8 +56,11 @@ func Init(path string) (err error) {
 				return e
 			}
 		}
-		if e := tx.Bucket([]byte("meta")).Put([]byte("version"), key(Version)); e != nil {
+		if e := tx.Bucket([]byte("meta")).Put([]byte("version"), key(StorageVersion)); e != nil {
 			return e
+		}
+		if _, err := tx.CreateBucket(confirmedBucket); err != nil {
+			return err
 		}
 		return put(tx.Bucket([]byte("blocks")), key(0), Genesis())
 	})
@@ -98,7 +102,7 @@ func Open(ctx context.Context, path string, options Options) (*Chain, error) {
 		return nil, e
 	}
 	c := &Chain{db: db, options: options}
-	if e = c.Validate(ctx); e != nil {
+	if e = c.prepare(ctx); e != nil {
 		_ = db.Close()
 		return nil, e
 	}
@@ -121,29 +125,6 @@ func readBlocks(tx *bolt.Tx) ([]Block, error) {
 		return nil
 	})
 	return blocks, e
-}
-func readAccounts(tx *bolt.Tx) (map[Address]Account, error) {
-	return readAccountsContext(context.Background(), tx)
-}
-func readAccountsContext(ctx context.Context, tx *bolt.Tx) (map[Address]Account, error) {
-	out := map[Address]Account{}
-	e := tx.Bucket([]byte("accounts")).ForEach(func(k, v []byte) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if len(k) != 32 {
-			return ErrCorrupt
-		}
-		var a Address
-		copy(a[:], k)
-		var s Account
-		if e := json.Unmarshal(v, &s); e != nil {
-			return e
-		}
-		out[a] = s
-		return nil
-	})
-	return out, e
 }
 func readPending(tx *bolt.Tx) ([]Transaction, error) {
 	return readPendingContext(context.Background(), tx)
@@ -202,7 +183,7 @@ func (c *Chain) Validate(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return c.db.View(func(tx *bolt.Tx) error { return c.validateTx(ctx, tx, Version) })
+	return c.db.View(func(tx *bolt.Tx) error { return c.validateTx(ctx, tx, StorageVersion) })
 }
 
 func (c *Chain) validateTx(ctx context.Context, tx *bolt.Tx, version uint64) error {
@@ -224,6 +205,11 @@ func (c *Chain) validateTx(ctx context.Context, tx *bolt.Tx, version uint64) err
 	if !bytes.Equal(tx.Bucket([]byte("meta")).Get([]byte("version")), key(version)) {
 		return bad("storage version", ErrVersion)
 	}
+	confirmed := tx.Bucket(confirmedBucket)
+	if version == StorageVersion && confirmed == nil {
+		return bad("confirmed index", ErrInvalid)
+	}
+	confirmedCount := 0
 	state := map[Address]Account{}
 	cursor := tx.Bucket([]byte("blocks")).Cursor()
 	var parent Block
@@ -248,6 +234,21 @@ func (c *Chain) validateTx(ctx context.Context, tx *bolt.Tx, version uint64) err
 		} else if err := applyBlockContext(ctx, state, parent, block); err != nil {
 			return bad(category, err)
 		}
+		if version == StorageVersion {
+			for i, transfer := range block.Transactions {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				id, err := transfer.ID()
+				if err != nil {
+					return bad(category, err)
+				}
+				if !bytes.Equal(confirmed.Get(id[:]), location(block.Height, i)) {
+					return bad("confirmed index", ErrInvalid)
+				}
+				confirmedCount++
+			}
+		}
 		found = true
 		parent = block
 		if height == math.MaxUint64 {
@@ -257,6 +258,22 @@ func (c *Chain) validateTx(ctx context.Context, tx *bolt.Tx, version uint64) err
 	}
 	if !found {
 		return bad("genesis", ErrInvalid)
+	}
+	if version == StorageVersion {
+		total := 0
+		err := confirmed.ForEach(func(k, v []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			total++
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if total != confirmedCount {
+			return bad("confirmed index", ErrInvalid)
+		}
 	}
 	// Compare accounts incrementally rather than building a second account map.
 	count := 0
@@ -363,26 +380,19 @@ func (c *Chain) Balance(a Address) (Account, error) {
 // NextNonce includes pending outgoing transactions. Submit remains the atomic
 // authority if another goroutine submits before the caller uses this nonce.
 func (c *Chain) NextNonce(a Address) (uint64, error) {
-	var n uint64
-	e := c.db.View(func(tx *bolt.Tx) error {
-		s, e := readAccounts(tx)
-		if e != nil {
-			return e
+	var nonce uint64
+	err := c.db.View(func(tx *bolt.Tx) error {
+		_, reserved, _, err := senderState(tx, a)
+		if err != nil {
+			return err
 		}
-		p, e := readPending(tx)
-		if e != nil {
-			return e
-		}
-		if e = reserve(s, p); e != nil {
-			return e
-		}
-		if s[a].Nonce == math.MaxUint64 {
+		if reserved.Nonce == math.MaxUint64 {
 			return ErrOverflow
 		}
-		n = s[a].Nonce + 1
+		nonce = reserved.Nonce + 1
 		return nil
 	})
-	return n, e
+	return nonce, err
 }
 
 // Submit verifies and atomically queues a signed transfer, reserving confirmed funds.
@@ -400,7 +410,7 @@ func (c *Chain) Submit(t Transaction) (Hash, error) {
 		if e != nil {
 			return e
 		}
-		s, e := readAccounts(tx)
+		s, e := transferAccounts(context.Background(), tx, p, false, t.Sender)
 		if e != nil {
 			return e
 		}
@@ -450,7 +460,7 @@ func (c *Chain) Mine(ctx context.Context, to Address) (Block, error) {
 		if e != nil {
 			return e
 		}
-		s, e := readAccountsContext(ctx, tx)
+		s, e := transferAccounts(ctx, tx, p, false)
 		if e != nil {
 			return e
 		}
@@ -521,7 +531,7 @@ func (c *Chain) commit(ctx context.Context, parent, b Block, selected []Transact
 				return ErrConflict
 			}
 		}
-		s, e := readAccounts(tx)
+		s, e := transferAccounts(context.Background(), tx, b.Transactions, true, b.RewardTo)
 		if e != nil {
 			return e
 		}
@@ -530,6 +540,9 @@ func (c *Chain) commit(ctx context.Context, parent, b Block, selected []Transact
 		}
 		if e = put(tx.Bucket([]byte("blocks")), key(b.Height), b); e != nil {
 			return e
+		}
+		if err := indexBlock(tx, b); err != nil {
+			return err
 		}
 		for a, account := range s {
 			if e = put(tx.Bucket([]byte("accounts")), a[:], account); e != nil {

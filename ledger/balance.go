@@ -14,19 +14,11 @@ type BalanceSummary struct {
 func (c *Chain) BalanceSummary(address Address) (BalanceSummary, error) {
 	var result BalanceSummary
 	err := c.db.View(func(tx *bolt.Tx) error {
-		state, err := readAccounts(tx)
+		confirmed, reserved, _, err := senderState(tx, address)
 		if err != nil {
 			return err
 		}
-		confirmed := state[address]
-		pending, err := readPending(tx)
-		if err != nil {
-			return err
-		}
-		if err = reserve(state, pending); err != nil {
-			return err
-		}
-		result = BalanceSummary{Confirmed: confirmed.Balance, Reserved: confirmed.Balance - state[address].Balance, Available: state[address].Balance, Nonce: confirmed.Nonce}
+		result = BalanceSummary{Confirmed: confirmed.Balance, Reserved: confirmed.Balance - reserved.Balance, Available: reserved.Balance, Nonce: confirmed.Nonce}
 		return nil
 	})
 	return result, err

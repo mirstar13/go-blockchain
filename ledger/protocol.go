@@ -229,12 +229,14 @@ func applyBlockContext(ctx context.Context, accounts map[Address]Account, parent
 	}
 	// Validate against a private candidate state so any later failure preserves
 	// the caller's state as well as the persisted ledger.
-	candidate := make(map[Address]Account, len(accounts))
-	for address, account := range accounts {
+	candidate := make(map[Address]Account, 2*len(b.Transactions)+1)
+	candidate[b.RewardTo] = accounts[b.RewardTo]
+	for _, transfer := range b.Transactions {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		candidate[address] = account
+		candidate[transfer.Sender] = accounts[transfer.Sender]
+		candidate[transfer.Recipient] = accounts[transfer.Recipient]
 	}
 	for _, t := range b.Transactions {
 		if err := ctx.Err(); err != nil {

@@ -114,6 +114,8 @@ results own their data; caller mutations do not modify database contents.
 bbolt stores version metadata, blocks keyed by height, account state, pending
 transactions keyed by increasing arrival sequence, and an ID-to-sequence index.
 Records use JSON for storage; JSON is **not** the hashing or signing format.
+Storage version 2 additionally maps confirmed transaction IDs to block height and
+transaction position, updated atomically with block/account/queue changes.
 
 Opening replays every block, validates genesis and proof of work, checks signatures
 and state transitions, compares the account index, and verifies pending reservations
@@ -135,7 +137,8 @@ server. Use the backup command below to create a consistent database snapshot.
 - `cmd/ledger`: CLI and signal handling.
 
 The old root-level `package main` demo and its API have been replaced. No legacy
-stored format existed. Storage is version 1; automatic migrations are not provided.
+stored format existed in that original demo. Storage is now version 2; valid version-1
+ledgers are upgraded atomically when opened, as described below.
 Tests cover encoding, invalid transfers/blocks, queue reservations and ordering,
 reopening/corruption, rollback, cancellation, wallet files, and the CLI workflow.
 CI runs formatting, dependency verification, build, vet, and tests on Linux and
@@ -209,8 +212,8 @@ the network identity or prevent replay between copies of the same ledger.
 
 Lookup returns `pending` or `confirmed`, the readable transaction, and its block
 height when confirmed. Unknown or cancelled IDs return an error; there is no
-cancellation history or tombstone index. Confirmed lookup scans stored block
-records; pending lookup uses the existing ID index.
+cancellation history or tombstone index. Confirmed lookup uses a persisted ID-to-block-location index and decodes one block;
+pending lookup uses the existing ID index.
 
 Cancellation requires the sender's Ed25519 signature. The CLI obtains an admission
 sequence and signs a separate `ledger/cancel/v1` message containing the network,
@@ -274,7 +277,8 @@ go test ./ledger -run='^$' -bench=BenchmarkTipRead -benchmem
 ```
 
 These numbers measure tip retrieval only, not overall mining speed or CLI startup.
-Whole-history replay and confirmed-transaction lookup still scale with chain size.
+Whole-history replay still scales with chain size. Confirmed lookup now uses the
+index described below.
 
 ## Windows 10 x64
 
@@ -283,6 +287,7 @@ storage, under a standard user account. Hosted CI runs Windows Server 2022, not
 Windows 10; the manual checklist below is required before publishing a release.
 ARM64, installers, executable signing, network shares, and non-NTFS filesystems are
 not part of this target. The executable is unsigned. Moving current-format files between platforms needs no platform-specific migration.
+Opening an older version-1 ledger performs the storage upgrade described below.
 
 Build from source with Go 1.23 or newer, or extract the Windows release ZIP:
 
@@ -412,7 +417,8 @@ err = ledger.Restore(ctx, backupPath, restoredPath)
 need cancellation. `Mine(ctx, address)` is unchanged. `ErrQueueFull` supports
 `errors.Is`; `*QueueFullError` exposes `Scope` (global/sender), `Limit`, and the
 current `Count`. Options are associated with an open handle; reopening accepts a
-new policy. Protocol identity, hashing, stored-data format, and key envelopes remain unchanged.
+new policy. The resilience API itself did not change protocol identity, hashing, or key envelopes.
+The later confirmed-transaction index uses storage version 2, described below.
 
 Ctrl+C propagates through database opening, validation, mining, backup, and restore.
 Validation streams block records and compares account and queue indexes, checking
@@ -436,3 +442,63 @@ rejections, cascading cancellations, mining, and reopening with changed limits.
 Fuzz inputs are bounded to four accounts, 32 actions, and four mined blocks. Neither
 production state-transition helpers nor reservation helpers serve as the model's
 oracle. Existing crash, concurrency, Windows, and backup tests remain enabled.
+
+## Independent protocol compatibility vectors
+
+`ledger/testdata/protocol_v1.json` pins transaction signing bytes, Ed25519 signatures,
+transaction IDs, cancellation signing bytes/signatures, and non-genesis block hashes.
+It covers ordinary values and maximum uint64 fields, using public RFC 8032 test seeds.
+The block fixtures check encoding/hash compatibility, not valid proof of work.
+
+The expected values were generated independently with Python `struct`, `hashlib`,
+and the `cryptography` Ed25519 implementation. Go tests read the committed fixture;
+they do not generate their own expected outputs. `tools/generate_protocol_vectors.py`
+is a manual reproduction tool requiring Python's cryptography package, not a Go
+runtime or CI dependency. Do not regenerate fixtures simply to make changed protocol
+code pass: an intentional incompatibility needs a protocol/version decision.
+
+## Indexed lookup and touched-account updates (storage version 2)
+
+New ledgers use storage version 2, independently of protocol version 1. The
+`confirmed_ids` bucket maps each transaction ID to two big-endian uint64 values:
+block height and transaction position. A mining commit writes this index in the
+same bbolt transaction as blocks, touched accounts, and pending removals. Lookup
+verifies that the indexed block/position actually contains the requested ID. Full
+validation checks every expected entry and rejects missing, incorrect, or extra
+entries. A damaged version-2 index is rejected, not silently rebuilt.
+
+Opening a version-1 ledger first validates its original history, account state,
+and pending indexes. Validation, index construction, and the version bump run in
+one write transaction. Invalid data or cancellation leaves version 1 unchanged;
+success publishes the complete upgrade atomically. Legacy snapshots can also be
+restored: only the restored copy is upgraded, leaving the source backup unchanged.
+There is no downgrade operation. Older binaries reject version 2; retain a known-good
+version-1 backup if rollback to an older binary is needed. Protocol identity,
+transaction IDs, signatures, block hashes, balances, and key files do not change.
+
+State application now copies only transaction senders, recipients, and the reward
+recipient. Mining writes only those accounts. Admission and mining load the accounts
+needed by queued/selected transfers rather than scanning all stored accounts.
+Balance summaries and nonce queries load the requested account and inspect its
+pending transfers. The pending queue is still scanned; no second persistent queue
+index or transaction-history cache was introduced.
+
+The storage benchmarks isolate account-summary and confirmed-lookup cost at
+increasing fixture sizes:
+
+```sh
+go test ./ledger -run='^$' -bench='Benchmark(AccountSummary|ConfirmedLookup)' -benchmem
+```
+
+On the current environment, before/after microbenchmarks showed account summary
+at 10,000 accounts moving from about 19 ms/op to a median 5.4 µs/op, and confirmed
+lookup across 1,000 blocks from about 28 ms/op to a median 90 µs/op. Allocations
+fell from roughly 2 MB to 840 bytes and 1.36 MB to 2.4 KB respectively. Host timing
+was noisy (post-change values use three runs); these are directional measurements,
+not latency guarantees or end-to-end CLI timings.
+
+Fixtures are synthetic records, not consensus-valid chains; measurements exclude
+opening/full validation and proof of work. Full replay still traverses all history
+and retains all confirmed account state, but it no longer copies that entire map
+for each block. `Blocks()` still returns the full history; pagination and startup
+checkpoints remain future work.

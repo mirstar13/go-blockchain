@@ -40,24 +40,35 @@ func lookup(tx *bolt.Tx, id Hash) (TransactionInfo, error) {
 		}
 		return TransactionInfo{Transaction: t, Status: "pending"}, nil
 	}
-	cursor := tx.Bucket([]byte("blocks")).Cursor()
-	for _, raw := cursor.First(); raw != nil; _, raw = cursor.Next() {
-		var block Block
-		if err := json.Unmarshal(raw, &block); err != nil {
-			return TransactionInfo{}, err
-		}
-		for _, t := range block.Transactions {
-			got, err := t.ID()
-			if err != nil {
-				return TransactionInfo{}, err
-			}
-			if got == id {
-				height := block.Height
-				return TransactionInfo{Transaction: t, Status: "confirmed", Height: &height}, nil
-			}
-		}
+	index := tx.Bucket(confirmedBucket)
+	if index == nil {
+		return TransactionInfo{}, ErrCorrupt
 	}
-	return TransactionInfo{}, ErrNotFound
+	loc := index.Get(id[:])
+	if loc == nil {
+		return TransactionInfo{}, ErrNotFound
+	}
+	if len(loc) != 16 {
+		return TransactionInfo{}, ErrCorrupt
+	}
+	height := binary.BigEndian.Uint64(loc[:8])
+	position := binary.BigEndian.Uint64(loc[8:])
+	var block Block
+	if err := json.Unmarshal(tx.Bucket([]byte("blocks")).Get(key(height)), &block); err != nil {
+		return TransactionInfo{}, err
+	}
+	if block.Height != height || position >= uint64(len(block.Transactions)) {
+		return TransactionInfo{}, ErrCorrupt
+	}
+	transfer := block.Transactions[position]
+	actual, err := transfer.ID()
+	if err != nil {
+		return TransactionInfo{}, err
+	}
+	if actual != id {
+		return TransactionInfo{}, ErrCorrupt
+	}
+	return TransactionInfo{Transaction: transfer, Status: "confirmed", Height: &height}, nil
 }
 
 // Lookup reports current pending/confirmed status. Cancellation leaves no tombstone.
