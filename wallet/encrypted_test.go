@@ -33,7 +33,7 @@ func TestEncryptedKeyLifecycle(t *testing.T) {
 		t.Fatal("plaintext seed in envelope")
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0600 {
+	if err != nil || (!RequiresEncryption && info.Mode().Perm() != 0600) {
 		t.Fatal(info, err)
 	}
 	if _, err = LoadEncrypted(path, []byte("wrong")); !errors.Is(err, ErrDecrypt) {
@@ -84,10 +84,13 @@ func TestEncryptedKeyLifecycle(t *testing.T) {
 	if _, err = CreateEncrypted(filepath.Join(dir, "empty"), nil); err == nil {
 		t.Fatal("empty passphrase accepted")
 	}
-	if err = os.Chmod(path, 0644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = LoadEncrypted(path, password); err == nil {
-		t.Fatal("unsafe permissions accepted")
+	if !RequiresEncryption {
+		if err = os.Chmod(path, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = LoadEncrypted(path, password); err == nil {
+			t.Fatal("unsafe permissions accepted")
+		}
+
 	}
 }

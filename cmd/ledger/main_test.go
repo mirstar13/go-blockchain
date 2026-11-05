@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -14,12 +16,22 @@ import (
 )
 
 func TestCLIWorkflow(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "ledger space тест")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	db := filepath.Join(dir, "ledger.db")
 	alice := filepath.Join(dir, "alice.key")
 	bob := filepath.Join(dir, "bob.key")
+	password := filepath.Join(dir, "passphrase.txt")
+	if err := os.WriteFile(password, []byte("test workflow password\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	call := func(args ...string) string {
 		t.Helper()
+		if args[0] == "transfer" || (args[0] == "wallet" && (args[1] == "create" || args[1] == "address")) {
+			args = append(args, "--passphrase-file", password)
+		}
 		var out bytes.Buffer
 		if e := run(context.Background(), args, &out); e != nil {
 			t.Fatalf("%v: %v", args, e)
@@ -81,11 +93,14 @@ func TestCLIWorkflow(t *testing.T) {
 }
 
 func TestEncryptedCancellationCLI(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "ledger space тест")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	db := filepath.Join(dir, "ledger.db")
 	key := filepath.Join(dir, "encrypted.key")
 	passwordFile := filepath.Join(dir, "password")
-	if err := os.WriteFile(passwordFile, []byte("test passphrase with spaces\n"), 0600); err != nil {
+	if err := os.WriteFile(passwordFile, []byte("test passphrase with spaces\r\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	call := func(args ...string) string {
@@ -124,14 +139,18 @@ func TestEncryptedCancellationCLI(t *testing.T) {
 	}
 	plain := filepath.Join(dir, "plain.key")
 	encryptedCopy := filepath.Join(dir, "copy.key")
-	address := call("wallet", "create", "--out", plain)
+	seed := make([]byte, ed25519.SeedSize)
+	if err := os.WriteFile(plain, []byte(hex.EncodeToString(seed)+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	address := hex.EncodeToString(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey))
 	if got := call("wallet", "encrypt", "--key", plain, "--out", encryptedCopy, "--passphrase-file", passwordFile); got != address {
 		t.Fatal(got)
 	}
 	if got := call("wallet", "address", "--key", encryptedCopy, "--passphrase-file", passwordFile); got != address {
 		t.Fatal(got)
 	}
-	if got := call("wallet", "address", "--key", plain); got != address {
-		t.Fatal("original key changed")
+	if data, err := os.ReadFile(plain); err != nil || string(data) != hex.EncodeToString(seed)+"\n" {
+		t.Fatal("original key changed", err)
 	}
 }

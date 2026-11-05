@@ -13,6 +13,9 @@ import (
 )
 
 func Create(path string) (ledger.Address, error) {
+	if RequiresEncryption {
+		return ledger.Address{}, fmt.Errorf("Windows requires encrypted wallets: use wallet create --passphrase-file <file>")
+	}
 	pub, priv, e := ed25519.GenerateKey(rand.Reader)
 	if e != nil {
 		return ledger.Address{}, e
@@ -39,6 +42,13 @@ func Create(path string) (ledger.Address, error) {
 	return a, nil
 }
 func Load(path string) (ed25519.PrivateKey, error) {
+	if RequiresEncryption {
+		return nil, fmt.Errorf("Windows requires encrypted wallets: supply --passphrase-file; migrate plaintext keys with wallet encrypt")
+	}
+	return loadPlaintext(path)
+}
+
+func loadPlaintext(path string) (ed25519.PrivateKey, error) {
 	data, e := ReadSecret(path, 4096)
 	if e != nil {
 		return nil, e

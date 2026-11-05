@@ -1,10 +1,19 @@
 name: Go
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
 permissions:
   contents: read
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -16,6 +25,80 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
-      - run: go test -race ./...
-      - run: go test ./ledger -run='^$' -fuzz='^FuzzTransferState$' -fuzztime=10s -parallel=2
-      - run: go test ./ledger -run='^$' -fuzz='^FuzzStoredRecords$' -fuzztime=10s -parallel=2
+      - if: runner.os == 'Linux'
+        run: go test -race ./...
+      - if: runner.os == 'Linux'
+        run: go test ./ledger -run='^$' -fuzz='^FuzzTransferState$' -fuzztime=10s -parallel=2
+      - if: runner.os == 'Linux'
+        run: go test ./ledger -run='^$' -fuzz='^FuzzStoredRecords$' -fuzztime=10s -parallel=2
+      - name: Build standalone Windows executable
+        if: runner.os == 'Windows'
+        env:
+          CGO_ENABLED: '0'
+          GOARCH: amd64
+        run: |
+          go build -trimpath -o dist/ledger.exe ./cmd/ledger
+          ./dist/ledger.exe --help
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: windows-amd64
+          path: dist/ledger.exe
+          if-no-files-found: error
+  release:
+    needs: check
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Validate version tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Expected vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-amd64
+          path: package
+      - name: Package executable and documentation
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cp README.md package/
+          mkdir release
+          (cd package && zip ../release/go-blockchain-"$TAG"-windows-amd64.zip ledger.exe README.md)
+          (cd release && sha256sum go-blockchain-"$TAG"-windows-amd64.zip > SHA256SUMS)
+      - name: Upload draft release (never publish)
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ github.ref_name }}
+        with:
+          script: |
+            const fs = require('fs');
+            const {owner, repo} = context.repo;
+            const tag = process.env.TAG;
+            const releases = await github.paginate(github.rest.repos.listReleases, {owner, repo, per_page: 100});
+            let release = releases.find(r => r.tag_name === tag);
+            if (release && !release.draft) throw new Error('Refusing to modify an already published release');
+            if (!release) {
+              release = (await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, name: tag, draft: true,
+                body: 'Windows 10 22H2 x64 verification is pending. Before manual publication, record OS build, standard-user account, NTFS location, and results for encrypted wallets/migration, transfers/cancellation, Ctrl+C mining, reopen, backup/restore, and overwrite refusal. Verify SHA256SUMS. See README Windows release checklist. This executable is unsigned.'
+              })).data;
+            }
+            // Recheck draft state before changing assets, including on reruns.
+            release = (await github.rest.repos.getRelease({owner, repo, release_id: release.id})).data;
+            if (!release.draft) throw new Error('Release was published during this job; refusing asset changes');
+            for (const name of [`go-blockchain-${tag}-windows-amd64.zip`, 'SHA256SUMS']) {
+              const existing = release.assets.find(a => a.name === name);
+              if (existing) await github.rest.repos.deleteReleaseAsset({owner, repo, asset_id: existing.id});
+              await github.rest.repos.uploadReleaseAsset({owner, repo, release_id: release.id, name, data: fs.readFileSync(`release/${name}`)});
+            }

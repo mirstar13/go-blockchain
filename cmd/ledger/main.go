@@ -111,6 +111,12 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	if fs.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
 	}
+	if wallet.RequiresEncryption && passphraseFile == "" {
+		switch cmd {
+		case "wallet create", "wallet address", "wallet encrypt", "transfer", "cancel":
+			return errors.New("Windows requires --passphrase-file for encrypted wallets; use wallet encrypt to migrate a plaintext key")
+		}
+	}
 	var password []byte
 	if passphraseFile != "" {
 		var err error
@@ -164,15 +170,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		if passphraseFile == "" || output == "" {
 			return errors.New("--out and --passphrase-file are required")
 		}
-		k, err := wallet.Load(keyPath)
-		if err != nil {
-			return err
-		}
-		defer clear(k)
-		if err = wallet.SaveEncrypted(output, k, password); err != nil {
-			return err
-		}
-		a, err := wallet.Address(k)
+		a, err := wallet.EncryptFile(keyPath, output, password)
 		if err != nil {
 			return err
 		}

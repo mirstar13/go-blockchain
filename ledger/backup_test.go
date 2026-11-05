@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"syscall"
 	"testing"
 
 	bolt "go.etcd.io/bbolt"
@@ -31,7 +33,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(backup)
-	if err != nil || info.Mode().Perm() != 0600 {
+	if err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) {
 		t.Fatal(info, err)
 	}
 	// The live chain advances after the snapshot; restoration must preserve its
@@ -92,13 +94,18 @@ func TestSnapshotFailurePreservesFiles(t *testing.T) {
 	if err != nil || !bytes.Equal(after, sentinel) {
 		t.Fatal("overwrote destination", err)
 	}
-	link := filepath.Join(dir, "link")
-	if err = os.Symlink(target, link); err != nil {
-		t.Fatal(err)
-	}
-	if err = c.Backup(link); !errors.Is(err, os.ErrExist) {
-		t.Fatal(err)
-	}
+	t.Run("symlink destination", func(t *testing.T) {
+		link := filepath.Join(dir, "link")
+		if err := os.Symlink(target, link); err != nil {
+			if runtime.GOOS == "windows" && (errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.Errno(1314))) {
+				t.Skip("Windows denied symlink privilege")
+			}
+			t.Fatal(err)
+		}
+		if err := c.Backup(link); !errors.Is(err, os.ErrExist) {
+			t.Fatal(err)
+		}
+	})
 	for _, kind := range []string{"empty", "truncated", "invalid genesis", "unsupported version"} {
 		t.Run(kind, func(t *testing.T) {
 			source := filepath.Join(t.TempDir(), "source")

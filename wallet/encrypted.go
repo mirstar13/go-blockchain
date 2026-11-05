@@ -110,8 +110,8 @@ func ReadSecret(path string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return nil, errors.New("secret must be a regular file accessible only to its owner")
+	if !privateFile(info) {
+		return nil, errors.New("secret must be a regular file with platform-appropriate access permissions")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
@@ -169,4 +169,18 @@ func SignCancellation(key ed25519.PrivateKey, request ledger.Cancellation) (ledg
 	}
 	copy(request.Signature[:], ed25519.Sign(key, request.SigningBytes()))
 	return request, nil
+}
+
+// EncryptFile is the only plaintext import operation supported on Windows.
+// It preserves the source and publishes an encrypted copy at a new path.
+func EncryptFile(source, destination string, password []byte) (ledger.Address, error) {
+	key, err := loadPlaintext(source)
+	if err != nil {
+		return ledger.Address{}, err
+	}
+	defer clear(key)
+	if err = SaveEncrypted(destination, key, password); err != nil {
+		return ledger.Address{}, err
+	}
+	return Address(key)
 }

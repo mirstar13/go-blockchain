@@ -70,12 +70,7 @@ func writeSnapshot(destination string, write func(*os.File) error) error {
 	if err = os.Link(temporary, destination); err != nil {
 		return err
 	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("snapshot created at %s, directory sync failed: %w", destination, err)
-	}
-	defer directory.Close()
-	if err = directory.Sync(); err != nil {
+	if err = syncSnapshotDirectory(dir); err != nil {
 		return fmt.Errorf("snapshot created at %s, directory sync failed: %w", destination, err)
 	}
 	return nil

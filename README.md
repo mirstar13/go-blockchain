@@ -268,3 +268,101 @@ go test ./ledger -run='^$' -bench=BenchmarkTipRead -benchmem
 
 These numbers measure tip retrieval only, not overall mining speed or CLI startup.
 Whole-history replay and confirmed-transaction lookup still scale with chain size.
+
+## Windows 10 x64
+
+The native target is **Windows 10 22H2 x64**, PowerShell 5.1 or newer, and local NTFS
+storage, under a standard user account. Hosted CI runs Windows Server 2022, not
+Windows 10; the manual checklist below is required before publishing a release.
+ARM64, installers, executable signing, network shares, and non-NTFS filesystems are
+not part of this target. The executable is unsigned. Moving current-format files between platforms needs no platform-specific migration.
+
+Build from source with Go 1.23 or newer, or extract the Windows release ZIP:
+
+```powershell
+go build -trimpath -o .\ledger.exe ./cmd/ledger
+.\ledger.exe --help
+```
+
+All Windows commands that create or use keys require `--passphrase-file`. Plaintext
+wallet creation and normal plaintext loading fail. `wallet encrypt` is the only
+plaintext import path and leaves the original file intact. Encryption protects key
+contents; it does not restrict who can read the passphrase file, replace files, or
+modify the ledger. Use Windows ACLs to protect the working directory and files.
+The application does not set or validate ACLs and does not interpret Unix mode bits
+on Windows. Administrator privileges are not required for normal CLI operation.
+
+Create a protected UTF-8 passphrase file without a BOM. Avoid Windows PowerShell
+5.1 `Out-File` defaults (UTF-16). This example restricts the file to the current
+user before writing its contents and does not put the passphrase in shell history:
+
+```powershell
+$pass = Join-Path $PWD 'passphrase.txt'
+New-Item -ItemType File -Path $pass -ErrorAction Stop | Out-Null
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls $pass /inheritance:r /grant:r "${identity}:(F)"
+if ($LASTEXITCODE -ne 0) { throw 'Could not restrict passphrase file access' }
+$secret = Read-Host 'Wallet passphrase' -AsSecureString
+$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
+try {
+    [IO.File]::WriteAllText($pass, [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr), [Text.UTF8Encoding]::new($false))
+} finally {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+    $secret.Dispose()
+}
+```
+
+A single trailing LF or CRLF is removed from the passphrase; other spaces remain
+significant. Keep the passphrase separate from encrypted-key backups. There is no
+password recovery. The following commands also demonstrate quoted paths:
+
+```powershell
+.\ledger.exe init --db '.\my ledger.db'
+$alice = .\ledger.exe wallet create --out '.\alice encrypted.key' --passphrase-file $pass
+$bob = .\ledger.exe wallet create --out '.\bob encrypted.key' --passphrase-file $pass
+.\ledger.exe mine --db '.\my ledger.db' --reward-to $alice
+$tx = .\ledger.exe transfer --db '.\my ledger.db' --key '.\alice encrypted.key' --passphrase-file $pass --to $bob --amount 10
+.\ledger.exe lookup --db '.\my ledger.db' --id $tx
+.\ledger.exe balance --db '.\my ledger.db' --address $alice
+.\ledger.exe cancel --db '.\my ledger.db' --id $tx --key '.\alice encrypted.key' --passphrase-file $pass
+.\ledger.exe backup --db '.\my ledger.db' --out '.\ledger snapshot.backup'
+.\ledger.exe restore --from '.\ledger snapshot.backup' --db '.\restored ledger.db'
+.\ledger.exe validate --db '.\restored ledger.db'
+
+# Import an existing plaintext seed, preserving its address and original file:
+.\ledger.exe wallet encrypt --key '.\legacy.key' --out '.\migrated encrypted.key' --passphrase-file $pass
+.\ledger.exe wallet address --key '.\migrated encrypted.key' --passphrase-file $pass
+```
+
+Check `$LASTEXITCODE` after commands in automation. Backup and restore refuse
+existing files, including symlinks, and do not fall back to non-atomic publication.
+Symlink creation tests may be skipped when Windows denies the necessary privilege;
+file overwrite and publication-race tests still run. Tests cover Unicode/spaced
+paths, CRLF input, file locking, subprocess crash recovery, and encrypted workflows.
+
+### Windows release checklist
+
+Pushing `vMAJOR.MINOR.PATCH` runs both CI platforms. After both succeed, CI packages
+`ledger.exe` and this README into `go-blockchain-vMAJOR.MINOR.PATCH-windows-amd64.zip`,
+generates `SHA256SUMS`, and uploads a **draft** GitHub release. Other version-tag
+shapes fail validation; existing published releases are never intentionally updated.
+Rerunning the job may replace assets of the same draft. Publication remains manual.
+
+Before publication, extract the ZIP on Windows 10 22H2 x64 as a standard user on
+local NTFS. Record the OS build, account type, artifact checksum, date, and each
+result in the draft release notes:
+
+1. Verify the ZIP's SHA-256 using `Get-FileHash -Algorithm SHA256`; compare with
+   `SHA256SUMS`. Run the extracted executable without installing Go.
+2. Create encrypted keys, reload their addresses, reject missing/wrong passwords,
+   and migrate a plaintext fixture while retaining its original address and file.
+3. Mine funds, queue transfers, inspect IDs and reservations, cancel a transfer with
+   later sender nonces, then mine and inspect a confirmed transfer.
+4. Exercise Ctrl+C while mining is active (repeat if the fixed-difficulty block
+   finishes first). Verify an interrupted uncommitted operation leaves the queue
+   and balances unchanged and the ledger still validates.
+5. Reopen, back up, restore to a new path, validate, and resume mining. Confirm that
+   existing destination files are refused. Include paths with spaces and Unicode.
+6. Record any skipped checks or failures; do not publish until required checks pass.
+
+Hosted CI success and Linux cross-compilation alone are not Windows 10 verification.
